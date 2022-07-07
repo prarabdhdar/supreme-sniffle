@@ -6,6 +6,10 @@ import numpy as np
 from scipy import special
 from scipy.io import savemat
 import tensorflow as tf
+
+config = tf.compat.v1.ConfigProto()
+config.gpu_options.allow_growth = True
+session = tf.compat.v1.InteractiveSession(config=config)
 reuse=tf.compat.v1.AUTO_REUSE
 dtype = np.float32
 
@@ -17,11 +21,13 @@ class model():
         self.M = M  #no of antennas
         self.K = K  #no of single antenna users
         self.Ns = Ns  #exploration time
-        self.state_num = 1
+        self.state_num = 2
         self.action_num = action_num
-        self.s = tf.compat.v1.placeholder(tf.float32, [None, 1], name ='s')
-        self.a = tf.compat.v1.placeholder(tf.float32, [None, ((self.M)*(self.K+1))], name ='a')
-        self.q_hat = self.create_dqn(self.s, 'dqn')
+        self.s = tf.compat.v1.placeholder(tf.float32, [None, 2], name ='s')
+        self.a = tf.compat.v1.placeholder(tf.float32, [None, self.action_num], name ='a')
+        self.s_c = tf.compat.v1.placeholder(tf.float32, [None, 2*self.K], name ='s_c')
+        self.q_hat = self.create_dqn(self.s, 'dqn', self.state_num)
+        self.qc_hat = self.create_dqn(self.s_c, 'dqn_c', 2*self.K)
         self.min_p = min_p
         self.max_p = max_p
         self.p_n = p_n
@@ -71,11 +77,24 @@ class model():
         return q_hat
 
     def predict_q(self, s):
-        return self.sess.run(self.q_hat, feed_dict={self.s: s})
+        return self.sess.run(self.create_dqn(s, 'dqn', 2), feed_dict={self.s: s})
+    
+    def predict_qc(self, s_c):
+        return self.sess.run(self.create_dqn(s_c, 'dqn_c', 2*self.K), feed_dict={self.s_c: s_c})
 
-    def predict_a(self, s):
-        q = self.predict_q(s)
-        return np.argmax(q, axis = 0)
+    def predict_a(self, s, s_c):
+        q_k = np.zeros((self.K+1)*(self.M))
+        for i in range(self.M):
+            q = self.predict_q(s[:, :, i])
+            q = np.argmax(q, axis = 0)
+            for j in range(self.K):
+                q_k[i*self.K+j] = q[j]
+        q = self.predict_qc(s_c)
+        q = np.argmax(q, axis = 0)
+        for j in range(self.M):
+            q_k[((self.M)*(self.K))+j] = q[j]
+        return np.float32(q_k)
+
 
     def select_action(self, a_hat, episode):
         epsilon = self.INITIAL_EPSILON - episode * (self.INITIAL_EPSILON - self.FINAL_EPSILON) / self.max_episode
@@ -83,6 +102,7 @@ class model():
         random_action = np.random.randint(0, high = self.action_num, size = ((self.K+1)*(self.M)))
         action_set = np.vstack([a_hat, random_action])
         power_index = action_set[random_index, range((self.K+1)*(self.M))] #[M]
+        power_index = power_index.astype(int)
         p = self.power_set[power_index] # W
         a = np.zeros((((self.K+1)*(self.M)), self.action_num), dtype = np.float32)
         a[range((self.K+1)*(self.M)), power_index] = 1.
@@ -123,31 +143,28 @@ class model():
         self.count = self.count + 1
         H_set_next = self.H_set[:,:,self.count]
         H_tilda_next = self.H_tilda[:, :, self.count]
-        s_actor_next = np.zeros((2*(self.M)*(self.K),1))
+        s_actor = np.zeros((self.K, 2, self.M))
         for i in range(self.M):
             for j in range(self.K):
-                s_actor_next[i*K+j] = H_set_next[i][j]
-        for i in range(self.M):
-            for j in range(self.K):
-                s_actor_next[M*K+i*K+j-1] = H_tilda_next[i][j]
-        s_actor_next = np.float32(s_actor_next)
-        return s_actor_next, reward
+                s_actor[j, 0, i] = H_set_next[i, j]
+                s_actor[j, 1, i] = H_tilda_next[i, j]
+        s_actor_next = np.float32(s_actor)
+        s_c_actor = np.hstack((H_set_next, H_tilda_next))
+        return s_actor_next, s_c_actor, reward
 
     def reset(self):
         self.count = 0
         self.H_set, self.H_tilda = self.state_space()
         H_set = self.H_set[:, :, self.count]
         H_tilda = self.H_tilda[:, :, self.count]
-        P = np.zeros([self.M*(self.K+1)], dtype=dtype)
-        s_actor = np.zeros((2*(self.M)*(self.K),1))
+        s_actor = np.zeros((self.K, 2, self.M))
         for i in range(self.M):
             for j in range(self.K):
-                s_actor[i*K+j] = H_set[i][j]
-        for i in range(self.M):
-            for j in range(self.K):
-                s_actor[M*K+i*K+j-1] = H_tilda[i][j]
+                s_actor[j, 0, i] = H_set[i, j]
+                s_actor[j, 1, i] = H_tilda[i, j]
         s_actor = np.float32(s_actor)
-        return s_actor, P
+        s_c_actor = np.hstack((H_set, H_tilda))
+        return s_actor, s_c_actor
 
     def save_params(self):
         dict_name={}
@@ -163,14 +180,13 @@ class model():
         reward_hist = list()
         for k in range(1, self.max_episode+1):  
             reward_dqn_list = list()
-            s_actor, _ = self.reset()
+            s_actor, s_c_actor = self.reset()
             for i in range(int(Ns)-1):
-                a = self.predict_a(s_actor)
+                a = self.predict_a(s_actor, s_c_actor)
                 p, a = self.select_action(a, k)
-                s_actor_next, r = self.step(p)
+                s_actor_next, s_c_actor, r = self.step(p)
                 s_actor = s_actor_next
                 reward_dqn_list.append(r)
-
             reward_hist.append(np.mean(reward_dqn_list))   # bps/Hz per link
             if k % interval == 0: 
                 reward = np.mean(reward_hist[-interval:])
@@ -186,13 +202,13 @@ class model():
 if __name__ == "__main__":
     fd = 10
     Ts = 20e-3
-    M = 2   
-    K = 2
+    M = 4   
+    K = 6
     Ns = 11
     max_p = 38. #dBm
     min_p = 1
     p_n = -114. #dBm
-    state_num = (2*(M)*(K))
+    state_num = 2
     action_num = 6  #action_num
 
     weight_file = 'dqn_6.mat'
