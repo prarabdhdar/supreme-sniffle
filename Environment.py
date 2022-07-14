@@ -31,14 +31,16 @@ class model():
         self.min_p = min_p
         self.max_p = max_p
         self.p_n = p_n
+        self.weight_file = 'dqn_6.mat'
         self.INITIAL_EPSILON = 0.2
         self.FINAL_EPSILON = 0.0001
         self.max_reward = 0
         self.batch_size = 500
-        self.max_episode = 5000
+        self.max_episode = 100
         self.buffer_size = 50000
+        self.params, self.params_c = self.get_params('dqn')
+        self.learning_rate = 1e-3
         self.power_set = np.hstack([np.zeros((1), dtype=np.float32), 1e-3*pow(10., np.linspace(self.min_p, self.max_p, self.action_num-1)/10.)])
-
 
     def state_space(self):
         H_set = np.zeros([self.M,self.K,self.Ns], dtype=dtype)
@@ -82,18 +84,34 @@ class model():
     def predict_qc(self, s_c):
         return self.sess.run(self.create_dqn(s_c, 'dqn_c', 2*self.K), feed_dict={self.s_c: s_c})
 
+    def get_params(self, para_name):
+        sets=[]
+        sets_c = []
+        i=0
+        for var in tf.compat.v1.trainable_variables():
+            if not var.name.find(para_name):
+                if(i>5):
+                    sets_c.append(var)
+                else:
+                    sets.append(var)
+                i=i+1
+        return sets, sets_c
+
     def predict_a(self, s, s_c):
         q_k = np.zeros((self.K+1)*(self.M))
+        self.q = np.zeros(((self.K+1)*(self.M), self.action_num))
         for i in range(self.M):
             q = self.predict_q(s[:, :, i])
-            q = np.argmax(q, axis = 0)
+            self.q = np.vstack((self.q, q))
+            q_a = np.argmax(q, axis = 0)
             for j in range(self.K):
-                q_k[i*self.K+j] = q[j]
+                q_k[i*self.K+j] = q_a[j]
         q = self.predict_qc(s_c)
-        q = np.argmax(q, axis = 0)
+        self.q = np.vstack((self.q, q))
+        q_c = np.argmax(q, axis = 0)
         for j in range(self.M):
-            q_k[((self.M)*(self.K))+j] = q[j]
-        return np.float32(q_k)
+            q_k[((self.M)*(self.K))+j] = q_c[j]
+        return np.float32(q_k), np.float32(self.q)
 
 
     def select_action(self, a_hat, episode):
@@ -104,6 +122,8 @@ class model():
         power_index = action_set[random_index, range((self.K+1)*(self.M))] #[M]
         power_index = power_index.astype(int)
         p = self.power_set[power_index] # W
+        if(np.sqrt(p.dot(p)) > self.max_p):
+            p = p*(np.sqrt(p.dot(p)))/np.float32(self.max_p)
         a = np.zeros((((self.K+1)*(self.M)), self.action_num), dtype = np.float32)
         a[range((self.K+1)*(self.M)), power_index] = 1.
         return p, a 
@@ -175,23 +195,32 @@ class model():
     def train(self, sess):
         self.sess = sess
         tf.compat.v1.global_variables_initializer().run()
-        interval = 100
+        interval = 1
         st = time.time()
         reward_hist = list()
         for k in range(1, self.max_episode+1):  
             reward_dqn_list = list()
             s_actor, s_c_actor = self.reset()
             for i in range(int(Ns)-1):
-                a = self.predict_a(s_actor, s_c_actor)
+                a,q = self.predict_a(s_actor, s_c_actor)
                 p, a = self.select_action(a, k)
                 s_actor_next, s_c_actor, r = self.step(p)
                 s_actor = s_actor_next
                 reward_dqn_list.append(r)
+                self.y = tf.compat.v1.reduce_sum(self.q_hat)
+                self.y_c = tf.compat.v1.reduce_sum(self.qc_hat)
+                self.r = tf.convert_to_tensor(-r, dtype=tf.float32)
+                self.loss = tf.nn.l2_loss(self.y - self.r)
+                self.loss_c = tf.nn.l2_loss(self.y_c - self.r)
+                with tf.compat.v1.variable_scope('opt_dqn', reuse = reuse):
+                    tf.compat.v1.train.AdamOptimizer(self.learning_rate).minimize(self.loss, var_list = self.params)
+            with tf.compat.v1.variable_scope('opt_dqn', reuse = reuse):
+                tf.compat.v1.train.AdamOptimizer(self.learning_rate).minimize(self.loss_c, var_list = self.params_c)
             reward_hist.append(np.mean(reward_dqn_list))   # bps/Hz per link
             if k % interval == 0: 
                 reward = np.mean(reward_hist[-interval:])
-                if reward > max_reward:
-                    model.save_params()
+                if reward > self.max_reward:
+                    self.save_params()
                     max_reward = reward
                 print("Episode(train):%d  DQN: %.3f  Time cost: %.2fs" 
                     %(k, reward, time.time()-st))
