@@ -1,10 +1,9 @@
 from tkinter.tix import ACROSSTOP
 import scipy
 import time
-import math
 import numpy as np
-from scipy import special
 from scipy.io import savemat
+from scipy.io import loadmat
 import tensorflow as tf
 
 config = tf.compat.v1.ConfigProto()
@@ -26,8 +25,14 @@ class model():
         self.s = tf.compat.v1.placeholder(tf.float32, [None, 2], name ='s')
         self.a = tf.compat.v1.placeholder(tf.float32, [None, self.action_num], name ='a')
         self.s_c = tf.compat.v1.placeholder(tf.float32, [None, 2*self.K], name ='s_c')
+        self.a_c = tf.compat.v1.placeholder(tf.float32, [None, self.action_num], name ='a_c')
         self.q_hat = self.create_dqn(self.s, 'dqn', self.state_num)
         self.qc_hat = self.create_dqn(self.s_c, 'dqn_c', 2*self.K)
+        self.y = tf.compat.v1.reduce_sum(tf.multiply(self.q_hat,self. a))
+        self.y_c = tf.compat.v1.reduce_sum(tf.multiply(self.qc_hat, self.a_c))
+        self.r = tf.compat.v1.placeholder(tf.float32, [None])
+        self.loss = tf.nn.l2_loss(self.y - self.r)
+        self.loss_c = tf.nn.l2_loss(self.y_c - self.r)
         self.min_p = min_p
         self.max_p = max_p
         self.p_n = p_n
@@ -35,13 +40,16 @@ class model():
         self.INITIAL_EPSILON = 0.2
         self.FINAL_EPSILON = 0.0001
         self.max_reward = 0
-        self.batch_size = 2
-        self.num = 0
-        self.max_episode = 200
+        self.max_episode = 5000
         self.buffer_size = 50000
+        self.num = 0
+        self.batch_size = 32
         self.params, self.params_c = self.get_params('dqn')
         self.learning_rate = 1e-3
         self.power_set = np.hstack([np.zeros((1), dtype=np.float32), 1e-3*pow(10., np.linspace(np.sqrt(self.min_p), np.sqrt(self.max_p), self.action_num-1)/10.)])
+        with tf.compat.v1.variable_scope('opt_dqn', reuse = reuse):
+            self.optimize = tf.compat.v1.train.AdamOptimizer(self.learning_rate).minimize(self.loss, var_list = self.params)
+            self.optimize_c = tf.compat.v1.train.AdamOptimizer(self.learning_rate).minimize(self.loss_c, var_list = self.params_c)
 
     def state_space(self):
         H_set = np.zeros([self.M,self.K,self.Ns], dtype=dtype)
@@ -92,6 +100,9 @@ class model():
         q = np.argmax(q, axis=1)
         return np.float32(q)
 
+    def predict_p(self, s, s_c):
+        return self.power_set[(self.predict_a(s, s_c)).astype(int)] 
+
     def get_params(self, para_name):
         sets=[]
         sets_c = []
@@ -114,34 +125,30 @@ class model():
         power_index = power_index.astype(int)
         p = self.power_set[power_index] # W
         if(np.dot(p.T, p) > self.max_p):
-            p = np.float32(p*self.max_p)/np.float32(np.sqrt(np.dot(p.T, p)))
+            p = np.float32(p*np.sqrt(self.max_p))/np.float32(np.sqrt(np.dot(p.T, p)))
         a = np.zeros((((self.K+1)*(self.M)), self.action_num), dtype = np.float32)
         a[range((self.K+1)*(self.M)), power_index] = 1
+        a_c = a[self.M*self.K : self.M*(self.K+1)]
+        a = a[0 : self.M*self.K]
         a = np.float32(a)
-        return p, a 
+        a_c = np.float32(a_c)
+        return p, a, a_c 
 
     def calculate_rate(self, P):
-        p_c = np.zeros(self.M)
-        p_k = np.zeros((self.M, self.K))
-        for i in range(self.M):
-            for j in range(self.K):
-                p_k[i][j] = P[(i*(self.K))+j]
-        for i in range(self.M):
-            p_c[i] = P[self.K*self.M+i-1]
         h_k = self.H_set[:, :, self.count]
         h_tilda = self.H_tilda[:, :, self.count]
         sigma2 = 1e-3*pow(10., self.p_n/10.)
         min_rc = 100000
         sum_rk=0
         for i in range(self.K):
-            num_rc = (h_k[:, i]*p_c).dot((h_k[:, i]*p_c))
-            num_rk = (h_k[:, i]*p_k[:, i]).dot((h_k[:, i]*p_k[:, i]))
-            denom_1 = (h_k[:, i]*p_k[:, i]).dot((h_k[:, i]*p_k[:, i]))
+            num_rc = np.dot((h_k[:, i]*P[self.M*self.K : self.M*(self.K+1)]).T, h_k[:, i]*P[self.M*self.K : self.M*(self.K+1)])
+            num_rk = np.dot((h_k[:, i]*P[self.M*i : self.M*(i+1)]).T, h_k[:, i]*P[self.M*i : self.M*(i+1)])
+            denom_1 = num_rk
             denom_2=0
             for j in range(self.K):
                 if(i==j):
                     continue
-                denom_2 = denom_2 + (h_tilda[:, i]*p_k[:, j]).dot((h_tilda[:, i]*p_k[:, j]))
+                denom_2 = denom_2 + np.dot((h_tilda[:, i]*P[self.M*j : self.M*(j+1)]).T, h_tilda[:, i]*P[self.M*j : self.M*(j+1)])
             denom_rc = denom_1 + denom_2 + sigma2
             denom_rk = denom_2 + sigma2
             min_rc = min(min_rc, np.log2(1 + num_rc/denom_rc))
@@ -182,41 +189,52 @@ class model():
         for var in tf.compat.v1.trainable_variables(): 
             dict_name[var.name]=var.eval()
         savemat(self.weight_file, dict_name)
+
+    def dqn(self, s, a, r):
+        return self.sess.run(self.optimize, feed_dict={
+            self.s: s, self.a: a, self.r: r})
+            
+    def dqn_c(self, s_c, a_c, r):
+        return self.sess.run(self.optimize_c, feed_dict={
+            self.s_c: s_c, self.a_c: a_c, self.r: r})     
     
     def train(self, sess):
         self.sess = sess
         tf.compat.v1.global_variables_initializer().run()
-        interval = 1
+        interval = 100
         st = time.time()
         reward_hist = list()
+        rewards = list()
         for k in range(1, self.max_episode+1):
             reward_dqn_list = list()
             s_actor, s_c_actor = self.reset()
             for i in range(int(Ns)-1):
-                a = self.predict_a(s_actor, s_c_actor)
-                p, a = self.select_action(a, k)
-                s_actor_next, s_c_actor, r = self.step(p)
-                s_actor = s_actor_next
-                reward_dqn_list.append(r)
                 self.num = self.num + 1
-            if(self.num >= self.batch_size):
-                self.num = 0
-                self.a = np.float32(np.zeros((self.K*self.M, self.action_num)))
-                self.a_c = np.float32(np.zeros((self.M, self.action_num)))
-                for i in range(self.K*self.M):
-                    for j in range(self.action_num):
-                        self.a[i,j] = a[i,j]
-                for i in range(self.M):
-                    for j in range(self.action_num):
-                        self.a_c[i,j] = a[self.M*self.K+i,j]
-                self.y = tf.compat.v1.reduce_sum(tf.multiply(self.q_hat, self.a))
-                self.y_c = tf.compat.v1.reduce_sum(tf.multiply(self.qc_hat, self.a_c))
-                self.r = tf.convert_to_tensor(r, dtype=tf.float32)
-                self.loss = tf.nn.l2_loss(self.y - self.r)
-                self.loss_c = tf.nn.l2_loss(self.y_c - self.r)
-                with tf.compat.v1.variable_scope('opt_dqn', reuse = reuse):
-                    tf.compat.v1.train.AdamOptimizer(self.learning_rate).minimize(self.loss, var_list = self.params)
-                    tf.compat.v1.train.AdamOptimizer(self.learning_rate).minimize(self.loss_c, var_list = self.params_c)
+                a = self.predict_a(s_actor, s_c_actor)
+                p, a, a_c = self.select_action(a, k)
+                s_actor_next, s_c_actor_next, r = self.step(p)
+                if((k==1) and (i==0)):
+                    s = s_actor
+                    s_c = s_c_actor
+                    action = a
+                    action_c = a_c
+                s = np.vstack((s, s_actor))
+                action = np.vstack((action, a))
+                s_c = np.vstack((s_c, s_c_actor))
+                action_c = np.vstack((action_c, a_c))
+                rewards.append(r)
+                s_actor = s_actor_next
+                s_c_actor = s_c_actor_next
+                reward_dqn_list.append(r)
+                if(self.num >= self.batch_size): 
+                    self.num = 0 
+                    self.dqn(s, action, rewards)
+                    self.dqn_c(s_c, action_c, rewards) 
+                    s = s_actor
+                    s_c = s_c_actor
+                    action = a
+                    action_c = a_c
+                    rewards = list()       
             reward_hist.append(np.mean(reward_dqn_list))   # bps/Hz per link
             if k % interval == 0: 
                 reward = np.mean(reward_hist[-interval:])
@@ -224,9 +242,31 @@ class model():
                     self.save_params()
                     self.max_reward = reward
                 print("Episode(train):%d  DQN: %.3f  Time cost: %.2fs" 
-                    %(k, reward, time.time()-st), self.max_reward)
-
+                    %(k, reward, time.time()-st))
             st = time.time()
+        return reward_hist
+
+    def test(self, sess):
+        max_episode = 100
+        self.Ns = int(5e2+1)
+        self.sess = sess
+        tf.compat.v1.global_variables_initializer().run()
+        st = time.time()
+        reward_hist = list()
+        for k in range(1, max_episode+1):  
+            reward_dqn_list = list()
+            s_actor, s_c_actor = self.reset()
+            for i in range(int(Ns)-1):
+                p = self.predict_p(s_actor, s_c_actor)
+                s_actor_next, s_c_actor_next, r = self.step(p)
+                s_actor = s_actor_next
+                s_c_actor = s_c_actor_next
+                reward_dqn_list.append(r)
+            reward_hist.append(np.mean(reward_dqn_list))   # bps/Hz per link
+            print("Episode(test):%d  DQN: %.3f  Time cost: %.2fs" 
+                %(k, reward_hist[-1], time.time()-st))
+            st = time.time()
+        print("Test average rate: %.3f" %(np.mean(reward_hist)))
         return reward_hist
 
 
@@ -235,12 +275,12 @@ if __name__ == "__main__":
     Ts = 20e-3
     M = 4
     K = 6
-    Ns = 12
+    Ns = 11
     max_p = 38. #dBm
-    min_p = 1
+    min_p = 5
     p_n = -114. #dBm
     state_num = 2
-    action_num = 6  #action_num
+    action_num = 10  #action_num
 
     weight_file = 'dqn_6.mat'
     mod = model(fd, Ts, M, K, Ns, min_p, max_p, p_n, action_num)
@@ -249,6 +289,4 @@ if __name__ == "__main__":
     with graph.as_default():
         with tf.compat.v1.Session() as sess:
             train_hist = mod.train(sess)
-
-
-
+            test_hist = mod.test(sess)
