@@ -28,11 +28,12 @@ class model():
         self.a_c = tf.compat.v1.placeholder(tf.float32, [None, self.action_num], name ='a_c')
         self.q_hat = self.create_dqn(self.s, 'dqn', self.state_num)
         self.qc_hat = self.create_dqn(self.s_c, 'dqn_c', 2*self.K)
-        self.y = tf.compat.v1.reduce_sum(tf.multiply(self.q_hat,self. a))
-        self.y_c = tf.compat.v1.reduce_sum(tf.multiply(self.qc_hat, self.a_c))
-        self.r = tf.compat.v1.placeholder(tf.float32, [None])
+        self.r = tf.compat.v1.reduce_sum(tf.multiply(self.q_hat,self. a), reduction_indices=1)
+        self.r_c = tf.compat.v1.reduce_sum(tf.multiply(self.qc_hat, self.a_c), reduction_indices=1)
+        self.y = tf.compat.v1.placeholder(tf.float32, [None])
+        self.y_c = tf.compat.v1.placeholder(tf.float32, [None])
         self.loss = tf.nn.l2_loss(self.y - self.r)
-        self.loss_c = tf.nn.l2_loss(self.y_c - self.r)
+        self.loss_c = tf.nn.l2_loss(self.y_c - self.r_c)
         self.min_p = min_p
         self.max_p = max_p
         self.p_n = p_n
@@ -41,15 +42,17 @@ class model():
         self.FINAL_EPSILON = 0.0001
         self.max_reward = 0
         self.max_episode = 5000
-        self.buffer_size = 50000
         self.num = 0
+        self.num_c = 0
         self.batch_size = 32
+        self.batch_size_c = 32
         self.params, self.params_c = self.get_params('dqn')
         self.learning_rate = 1e-3
+        self.learning_rate_c = 1e-3
         self.power_set = np.hstack([np.zeros((1), dtype=np.float32), 1e-3*pow(10., np.linspace(np.sqrt(self.min_p), np.sqrt(self.max_p), self.action_num-1)/10.)])
         with tf.compat.v1.variable_scope('opt_dqn', reuse = reuse):
             self.optimize = tf.compat.v1.train.AdamOptimizer(self.learning_rate).minimize(self.loss, var_list = self.params)
-            self.optimize_c = tf.compat.v1.train.AdamOptimizer(self.learning_rate).minimize(self.loss_c, var_list = self.params_c)
+            self.optimize_c = tf.compat.v1.train.AdamOptimizer(self.learning_rate_c).minimize(self.loss_c, var_list = self.params_c)
 
     def state_space(self):
         H_set = np.zeros([self.M,self.K,self.Ns], dtype=dtype)
@@ -190,13 +193,13 @@ class model():
             dict_name[var.name]=var.eval()
         savemat(self.weight_file, dict_name)
 
-    def dqn(self, s, a, r):
+    def dqn(self, s, a, y):
         return self.sess.run(self.optimize, feed_dict={
-            self.s: s, self.a: a, self.r: r})
+            self.s: s, self.a: a, self.y: y})
             
-    def dqn_c(self, s_c, a_c, r):
+    def dqn_c(self, s_c, a_c, y_c):
         return self.sess.run(self.optimize_c, feed_dict={
-            self.s_c: s_c, self.a_c: a_c, self.r: r})     
+            self.s_c: s_c, self.a_c: a_c, self.y_c: y_c})     
     
     def train(self, sess):
         self.sess = sess
@@ -204,7 +207,12 @@ class model():
         interval = 100
         st = time.time()
         reward_hist = list()
+        s = list()
+        action = list()
         rewards = list()
+        s_c = list()
+        action_c = list()
+        rewards_c = list()
         for k in range(1, self.max_episode+1):
             reward_dqn_list = list()
             s_actor, s_c_actor = self.reset()
@@ -213,28 +221,31 @@ class model():
                 a = self.predict_a(s_actor, s_c_actor)
                 p, a, a_c = self.select_action(a, k)
                 s_actor_next, s_c_actor_next, r = self.step(p)
-                if((k==1) and (i==0)):
-                    s = s_actor
-                    s_c = s_c_actor
-                    action = a
-                    action_c = a_c
-                s = np.vstack((s, s_actor))
-                action = np.vstack((action, a))
-                s_c = np.vstack((s_c, s_c_actor))
-                action_c = np.vstack((action_c, a_c))
-                rewards.append(r)
+                for j in range(len(s_actor)):
+                    self.num = self.num + 1
+                    s.append(s_actor[i])
+                    action.append(a[i])
+                    rewards.append(r)
+                for j in range(len(s_c_actor)):
+                    self.num_c = self.num_c + 1
+                    s_c.append(s_c_actor[j])
+                    action_c.append(a_c[j])
+                    rewards_c.append(r)
                 s_actor = s_actor_next
                 s_c_actor = s_c_actor_next
                 reward_dqn_list.append(r)
                 if(self.num >= self.batch_size): 
                     self.num = 0 
                     self.dqn(s, action, rewards)
-                    self.dqn_c(s_c, action_c, rewards) 
-                    s = s_actor
-                    s_c = s_c_actor
-                    action = a
-                    action_c = a_c
-                    rewards = list()       
+                    s.clear()
+                    action.clear()
+                    rewards.clear()
+                if(self.num_c >= self.batch_size_c):
+                    self.num_c = 0
+                    self.dqn_c(s_c, action_c, rewards_c) 
+                    s_c.clear()
+                    action_c.clear()
+                    rewards_c.clear()    
             reward_hist.append(np.mean(reward_dqn_list))   # bps/Hz per link
             if k % interval == 0: 
                 reward = np.mean(reward_hist[-interval:])
